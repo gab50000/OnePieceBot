@@ -23,14 +23,15 @@ ADMIN_ID = int(config["Telegram"]["admin_id"])
 
 DB = TinyDB("bot_db.json")
 AUTH = DB.table("authorized")
+LAST_UPDATE = DB.table("last_update")
 
 
 def check_id(func):
-    def new_func(self, bot, update):
+    def new_func(self, bot, update, **kwargs):
         requesting_id = update.message.chat_id
         if AUTH.search(Query().id == requesting_id):
             logger.debug("Found ID in database")
-            func(self, bot, update)
+            func(self, bot, update, **kwargs)
         else:
             chat = update.message.chat
             warning = f"User {chat.first_name} {chat.last_name} with id " \
@@ -47,11 +48,16 @@ class ComicBot:
         handlers = [CommandHandler("start", self.start),
                     CommandHandler("comic_list", self.get_comic_list),
                     CommandHandler("read", self.send_comic, pass_args=True),
-                    CommandHandler("authorize", self.authorize, pass_args=True)]
+                    CommandHandler("authorize", self.authorize, pass_args=True),
+                    CommandHandler("watch_chapters", self.watch_chapters,
+                                   pass_job_queue=True),
+                    CommandHandler("unwatch", self.unwatch,
+                                   pass_job_queue=True)]
         dispatcher = self.updater.dispatcher
         for h in handlers:
             dispatcher.add_handler(h)
         self.updater.start_polling()
+        self.jobs = {}
 
     @property
     def comic_list(self):
@@ -109,10 +115,41 @@ class ComicBot:
             bot.send_chat_action(chat_id=user_id, action=telegram.ChatAction.UPLOAD_PHOTO)
             self.updater.bot.send_photo(chat_id=user_id, photo=pic, timeout=120)
 
-    @check_id
-    def check_latest(self, bot, update):
+    def check_latest(self, bot, job):
+        user_id = job.context
         chapters = self.chapters
         latest = max(chapters, key=int)
+        if not LAST_UPDATE.all():
+            LAST_UPDATE.insert({"chapter": latest})
+        if latest != LAST_UPDATE.all()[0]["chapter"]:
+            bot.send_message(chat_id=user_id,
+                             text=f"Neues Kapitel {latest} erhältlich!")
+        else:
+            logger.debug("No new chapter found")
+            bot.send_message(chat_id=user_id,
+                             text="Kein neues Kapitel erhältlich")
+
+    @check_id
+    def watch_chapters(self, bot, update, job_queue):
+        user_id = update.message.from_user.id
+
+        if user_id not in self.jobs:
+            bot.send_message(chat_id=user_id,
+                             text="Prüfe halbstündlich auf Updates")
+            new_job = job_queue.run_repeating(self.check_latest, interval=1800, first=0,
+                                              context=update.message.chat_id)
+            self.jobs[user_id] = new_job
+        else:
+            bot.send_message(chat_id=user_id,
+                             text="Prüfe schon auf Updates")
+
+    @check_id
+    def unwatch(self, bot, update, job_queue):
+        user_id = update.message.from_user.id
+        bot.send_message(chat_id=user_id,
+                         text="Beende halbstündigen Check")
+        self.jobs[user_id].schedule_removal()
+        del self.jobs[user_id]
 
     def authorize(self, bot, update, args):
         user_id = update.message.from_user.id
