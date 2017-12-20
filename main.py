@@ -126,8 +126,6 @@ class ComicBot:
                              text=f"Neues Kapitel {latest} erhältlich!")
         else:
             logger.debug("No new chapter found")
-            bot.send_message(chat_id=user_id,
-                             text="Kein neues Kapitel erhältlich")
 
     @check_id
     def watch_chapters(self, bot, update, job_queue):
@@ -146,10 +144,15 @@ class ComicBot:
     @check_id
     def unwatch(self, bot, update, job_queue):
         user_id = update.message.from_user.id
-        bot.send_message(chat_id=user_id,
-                         text="Beende halbstündigen Check")
-        self.jobs[user_id].schedule_removal()
-        del self.jobs[user_id]
+        if user_id in self.jobs:
+            bot.send_message(chat_id=user_id,
+                            text="Beende halbstündigen Check")
+            self.jobs[user_id].schedule_removal()
+            del self.jobs[user_id]
+        else:
+            bot.send_message(chat_id=user_id,
+                            text="Keinen laufenden Job gefunden")
+
 
     def authorize(self, bot, update, args):
         user_id = update.message.from_user.id
