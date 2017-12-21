@@ -1,92 +1,70 @@
 import configparser
+import datetime
 from io import BytesIO
 import re
 import zipfile
+from functools import wraps
 
 import telegram
 from telegram.ext import Dispatcher, MessageHandler, Updater, CommandHandler
 from lxml import html
 import requests
 import daiquiri
-from tinydb import TinyDB, Query
+import fire
+
+from telegram_helper import check_id, command, TelegramBot
 
 
-daiquiri.setup(level=daiquiri.logging.DEBUG)
 logger = daiquiri.getLogger(__name__)
 
 
-config = configparser.ConfigParser()
-config.read("auth.cfg")
-TOKEN = config["Telegram"]["token"]
-ADMIN_ID = int(config["Telegram"]["admin_id"])
-
-
-DB = TinyDB("bot_db.json")
-AUTH = DB.table("authorized")
-LAST_UPDATE = DB.table("last_update")
-
-
-def check_id(func):
-    def new_func(self, bot, update, **kwargs):
-        requesting_id = update.message.chat_id
-        if AUTH.search(Query().id == requesting_id):
-            logger.debug("Found ID in database")
-            func(self, bot, update, **kwargs)
-        else:
-            chat = update.message.chat
-            warning = f"User {chat.first_name} {chat.last_name} with id " \
-                      f"{requesting_id} not in id list"
-            logger.warning(warning)
-            bot.send_message(chat_id=ADMIN_ID, text=warning)
+def date_cache(func):
+    cache = {}
+    @wraps(func)
+    def new_func(*args, **kwargs):
+        key = (datetime.date.today(), args, frozenset(kwargs.items()))
+        logger.debug("Got key %s", key)
+        if key in cache:
+            logger.debug("Found key in cache")
+        return cache.setdefault(key, func(*args, **kwargs))
     return new_func
 
 
-class ComicBot:
-    def __init__(self):
-        self.updater = Updater(token=TOKEN)
-        self.url = "https://jaiminisbox.com/reader/series/one-piece-2/"
-        handlers = [CommandHandler("start", self.start),
-                    CommandHandler("comic_list", self.get_comic_list),
-                    CommandHandler("read", self.send_comic, pass_args=True),
-                    CommandHandler("authorize", self.authorize, pass_args=True),
-                    CommandHandler("watch_chapters", self.watch_chapters,
-                                   pass_job_queue=True),
-                    CommandHandler("unwatch", self.unwatch,
-                                   pass_job_queue=True)]
-        dispatcher = self.updater.dispatcher
-        for h in handlers:
-            dispatcher.add_handler(h)
-        self.updater.start_polling()
-        self.jobs = {}
+class ComicBot(TelegramBot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.jobs = self.database.setdefault("jobs", [])
+        self.last_chapter = self.database.setdefault("last_chapter", None)
+        self.job_interval = 30
 
-    @property
-    def comic_list(self):
+    def get_comic_links(self):
         r1 = requests.get(self.url)
         tree = html.fromstring(r1.content)
         comic_links = [link for link in tree.xpath("//a/@href") if "/download/" in link]
         return comic_links
 
-    @property
-    def chapters(self):
-        links = self.comic_list
+    def get_chapters(self):
+        links = self.get_comic_links()
         chapters = [re.search(r"(\d+)\/$", link).group(1) for link in links]
         return chapters
 
     @check_id
+    @command
     def start(self, bot, update):
-        user_id = update.message.from_user.id
-        bot.send_message(chat_id=user_id, text="Hallo!")
+        message = update.message
+        message.reply_text("Hallo!")
 
     @check_id
+    @command
     def get_comic_list(self, bot, update):
-        user_id = update.message.from_user.id
-        bot.send_message(chat_id=user_id,
-                         text="Folgende Kapitel sind verfügbar:")
-        liste = "\n".join(f"Kapitel {chap}" for chap in self.chapters)
-        bot.send_message(chat_id=user_id, text=liste)
+        message = update.message
+        message.reply_text("Folgende Kapitel sind verfügbar:")
+        liste = "\n".join(f"Kapitel {chap}" for chap in self.get_chapters())
+        message.reply_text(liste)
 
+    @date_cache
     def download_comic(self, number):
-        comic_link = self.comic_list[number]
+        comic_link = self.get_comic_links()[number]
         r = requests.get(comic_link, stream=True)
         if r.status_code != 200:
             raise ConnectionError("Could not download comic")
@@ -97,79 +75,94 @@ class ComicBot:
         return pics
 
     @check_id
+    @command(pass_args=True)
     def send_comic(self, bot, update, args):
-        user_id = update.message.from_user.id
+        message = update.message
+        chat = message.chat
+        user_id = message.from_user.id
         logger.debug(args)
         if len(args) != 1:
-            bot.send_message(chat_id=user_id, text="Bitte genau eine "
-                             "Kapitelnummer angeben!")
+            message.reply_text("Bitte genau eine Kapitelnummer angeben!")
             return
         try:
-            index = self.chapters.index(args[0])
+            index = self.get_chapters().index(args[0])
         except ValueError:
-            bot.send_message(chat_id=user_id, text="Kapitel nicht gefunden")
+            message.reply_text("Kapitel nicht gefunden")
             return
-        bot.send_message(chat_id=user_id, text="Ich lade den neuesten Comic...")
+        message.reply_text("Ich lade den neuesten Comic...")
         comic = self.download_comic(index)
         for pic in comic:
-            bot.send_chat_action(chat_id=user_id, action=telegram.ChatAction.UPLOAD_PHOTO)
-            self.updater.bot.send_photo(chat_id=user_id, photo=pic, timeout=120)
+            chat.send_action(action=telegram.ChatAction.UPLOAD_PHOTO)
+            message.reply_photo(photo=pic, timeout=120)
 
     def check_latest(self, bot, job):
         user_id = job.context
-        chapters = self.chapters
+        chapters = self.get_chapters()
         latest = max(chapters, key=int)
-        if not LAST_UPDATE.all():
-            LAST_UPDATE.insert({"chapter": latest})
-        if latest != LAST_UPDATE.all()[0]["chapter"]:
+        if not self.last_chapter:
+            self.last_chapter = latest
+        if latest != self.last_chapter:
             bot.send_message(chat_id=user_id,
                              text=f"Neues Kapitel {latest} erhältlich!")
         else:
+            bot.send_message(chat_id=user_id,
+                             text="Nix gefunden")
             logger.debug("No new chapter found")
 
+    def restart_jobs(self):
+        self.current_jobs = {}
+        job_queue = self.updater.job_queue
+        for user_id in self.jobs:
+            logger.debug(f"Restart job for user {user_id}")
+            new_job = job_queue.run_repeating(self.check_latest,
+                                              interval=self.job_interval, first=0,
+                                              context=user_id)
+            self.current_jobs[user_id] = new_job
+
     @check_id
+    @command(pass_job_queue=True)
     def watch_chapters(self, bot, update, job_queue):
-        user_id = update.message.from_user.id
+        # store jobs of this session
+        self.current_jobs = {}
+        message = update.message
+        user_id = message.from_user.id
 
         if user_id not in self.jobs:
-            bot.send_message(chat_id=user_id,
-                             text="Prüfe halbstündlich auf Updates")
-            new_job = job_queue.run_repeating(self.check_latest, interval=1800, first=0,
-                                              context=update.message.chat_id)
-            self.jobs[user_id] = new_job
+            message.reply_text("Prüfe halbstündlich auf Updates")
+            new_job = job_queue.run_repeating(self.check_latest,
+                                              interval=self.job_interval,
+                                              first=0, context=user_id)
+            self.jobs.append(user_id)
+            self.current_jobs[user_id] = new_job
         else:
-            bot.send_message(chat_id=user_id,
-                             text="Prüfe schon auf Updates")
+            message.reply_text("Prüfe schon auf Updates")
 
     @check_id
+    @command(pass_job_queue=True)
     def unwatch(self, bot, update, job_queue):
-        user_id = update.message.from_user.id
+        message = update.message
+        user_id = message.from_user.id
         if user_id in self.jobs:
-            bot.send_message(chat_id=user_id,
-                            text="Beende halbstündigen Check")
-            self.jobs[user_id].schedule_removal()
-            del self.jobs[user_id]
+            message.reply_text("Beende halbstündigen Check")
+            self.current_jobs[user_id].schedule_removal()
+            self.jobs.remove(user_id)
         else:
-            bot.send_message(chat_id=user_id,
-                            text="Keinen laufenden Job gefunden")
+            message.reply_text("Keinen laufenden Job gefunden")
 
 
-    def authorize(self, bot, update, args):
-        user_id = update.message.from_user.id
-        if user_id != ADMIN_ID:
-            logger.debug("Authorize request from non-Admin")
-            return
-        if not args:
-            logger.debug("No ids specified")
-            return
-        try:
-            new_ids = [int(arg) for arg in args]
-        except ValueError:
-            bot.send_message(chat_id=user_id, text="Ungültige id")
-        logger.debug("New ids: %s", new_ids)
-        for id_ in new_ids:
-            AUTH.insert({"id": id_})
-            bot.send_message(chat_id=user_id, text=f"Füge id {id_} hinzu.")
+def run(level="info"):
+    daiquiri.setup(level=getattr(daiquiri.logging, level.upper()))
+    comic_bot = ComicBot.from_configfile("comicbot.cfg")
+    comic_bot.restart_jobs()
+    comic_bot.run()
 
 
-comic_bot = ComicBot()
+def read_shelve(fname):
+    import shelve
+    with shelve.open(fname) as f:
+        for k, v in f.items():
+            print(f"{k}: {v}")
+
+
+if __name__ == "__main__":
+    fire.Fire()
