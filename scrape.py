@@ -1,10 +1,21 @@
+import configparser
 import time
 
 import selenium
 from selenium import webdriver
+import daiquiri
 
 
-URL = "https://jaiminisbox.com/reader/series/one-piece-2"
+logger = daiquiri.getLogger()
+
+
+cp = configparser.ConfigParser()
+cp.read_file("scrape.cfg")
+
+
+URL = cp.get("scrape", "url")
+PATH = cp.get("scrape", "path")
+
 
 xpath_comic_link = '//*[@id="content"]/div/div[3]/div[2]/div[2]/div[2]/a'
 xpath = '//*[@id="page"]/div/a/img'
@@ -30,9 +41,11 @@ def open_comic(driver, link):
     return pic_links
 
 
-
 def main():
-    driver = webdriver.PhantomJS()
+    daiquiri.setup(level=daiquiri.logging.DEBUG)
+    options = webdriver.ChromeOptions()
+    options.set_headless()
+    driver = webdriver.Chrome(executable_path=PATH, options=options)
     driver.get(URL)
     print(driver.title)
     links = get_links(driver)
