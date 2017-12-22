@@ -13,6 +13,7 @@ import daiquiri
 import fire
 
 from telegram_helper import check_id, command, TelegramBot
+from scrape import Scraper
 
 
 logger = daiquiri.getLogger(__name__)
@@ -37,10 +38,10 @@ class ComicBot(TelegramBot):
         self.last_chapter = self.database.setdefault("last_chapter", None)
         self.job_interval = 30
 
-    def get_comic_links(self):
+    def get_comic_links(self, mode="download"):
         r1 = requests.get(self.url)
         tree = html.fromstring(r1.content)
-        comic_links = [link for link in tree.xpath("//a/@href") if "/download/" in link]
+        comic_links = [link for link in tree.xpath("//a/@href") if f"/{mode}/" in link]
         return comic_links
 
     def get_chapters(self):
@@ -95,6 +96,28 @@ class ComicBot(TelegramBot):
             chat.send_action(action=telegram.ChatAction.UPLOAD_PHOTO)
             message.reply_photo(photo=pic, timeout=120)
 
+    @check_id
+    @command(pass_args=True)
+    def send_comic_links(self, bot, update, args):
+        message = update.message
+
+        if not args:
+            message.reply_text("Bitte Kapitelnummer angeben!")
+            return
+
+        chap_nr = args[0]
+        scraper = Scraper()
+        comic_links = self.get_comic_links(mode="read")
+        dest_links = [link for link in comic_links if link.endswith(f"{chap_nr}/")]
+
+        if not dest_links:
+            message.reply_text("Kapitel nicht gefunden")
+            return
+
+        dest_link = dest_links[0]
+        for link in scraper.open_comic(dest_link):
+            message.reply_photo(link, timeout=120)
+
     def check_latest(self, bot, job):
         user_id = job.context
         chapters = self.get_chapters()
@@ -104,9 +127,11 @@ class ComicBot(TelegramBot):
         if latest != self.last_chapter:
             bot.send_message(chat_id=user_id,
                              text=f"Neues Kapitel {latest} erhältlich!")
-        else:
+            self.last_chapter = latest
+            links = self.get_comic_links()
             bot.send_message(chat_id=user_id,
-                             text="Nix gefunden")
+                             text=links[-1])
+        else:
             logger.debug("No new chapter found")
 
     def restart_jobs(self):
